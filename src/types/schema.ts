@@ -74,12 +74,23 @@ export interface AISemanticColumnHint {
   maxNumber?: number;
 }
 
+export interface SeedRow {
+  [columnName: string]: string | number | boolean | null;
+}
+
+export interface TableSeedContext {
+  tableName: string;
+  domain: string;
+  seeds: SeedRow[];
+}
+
 export interface GenerationConfig {
   sql: string;
   locale: SupportedLocale;
   rowsPerTable: number;
   seed?: number;
   useAiEnrichment?: boolean;
+  aiSeedContext?: Record<string, TableSeedContext>;
 }
 
 export type TableRows = Record<string, string | number | boolean | null>[];

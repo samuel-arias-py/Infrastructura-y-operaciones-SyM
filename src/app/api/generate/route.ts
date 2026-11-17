@@ -6,6 +6,7 @@ import {
   AISemanticColumnHint,
   ParsedTable,
   SupportedLocale,
+  TableSeedContext,
 } from '@/types/schema';
 
 /**
@@ -14,17 +15,24 @@ import {
 const GenerateRequestSchema = z.object({
   sql: z.string().min(10, 'El esquema SQL es demasiado corto.'),
   locale: z.enum(['es_CO', 'es_MX', 'en_US', 'es_ES']).default('es_CO'),
-  rowsPerTable: z.number().int().min(1).max(500).default(15),
+  rowsPerTable: z.number().int().min(1).max(2000).default(15),
   seed: z.number().int().optional(),
   useAiEnrichment: z.boolean().optional().default(false),
+  aiSeedContext: z
+    .record(
+      z.object({
+        tableName: z.string(),
+        domain: z.string(),
+        seeds: z.array(z.record(z.union([z.string(), z.number(), z.boolean(), z.null()]))),
+      })
+    )
+    .optional(),
 });
 
 /**
  * Esquema Zod preparado para Structured Outputs de IA (OpenAI response_format / Gemini responseSchema).
- * Permite que un LLM analice nombres de tablas y columnas ambiguas y devuelva
- * categorías semánticas y ejemplos realistas estrictamente tipados.
  */
-export const AIStructuredOutputSchema = z.object({
+const AIStructuredOutputSchema = z.object({
   hints: z.array(
     z.object({
       tableName: z.string(),
@@ -67,9 +75,45 @@ export const AIStructuredOutputSchema = z.object({
 });
 
 /**
- * Capa de enriquecimiento semántico con IA (Structured Outputs).
- * Si existe OPENAI_API_KEY configurada, consulta al modelo con JSON Schema estricto;
- * de lo contrario, aplica inferencia contextual heurística de respaldo sin bloquear el MVP.
+ * Obtiene 10 semillas inteligentes desde /api/generate-context o llamada interna
+ */
+async function fetchAiSeeds(
+  tables: ParsedTable[],
+  locale: SupportedLocale,
+  origin: string
+): Promise<Record<string, TableSeedContext>> {
+  try {
+    const tableSummaries = tables.map((t) => ({
+      name: t.name,
+      columns: t.columns.map((c) => ({ name: c.name, type: c.rawType })),
+    }));
+
+    const res = await fetch(`${origin}/api/generate-context`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tables: tableSummaries,
+        locale,
+      }),
+    });
+
+    if (!res.ok) return {};
+    const data = await res.json();
+    const map: Record<string, TableSeedContext> = {};
+    if (data.tables && Array.isArray(data.tables)) {
+      for (const t of data.tables) {
+        map[t.tableName] = t;
+      }
+    }
+    return map;
+  } catch (err) {
+    console.warn('Error fetching seeds from /api/generate-context:', err);
+    return {};
+  }
+}
+
+/**
+ * Capa de enriquecimiento semántico con IA de respaldo
  */
 async function resolveAiSemanticHints(
   tables: ParsedTable[],
@@ -77,7 +121,6 @@ async function resolveAiSemanticHints(
 ): Promise<AISemanticColumnHint[]> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
-    // Fallback determinístico enriquecido cuando no hay API Key configurada
     const contextualHints: AISemanticColumnHint[] = [];
     for (const table of tables) {
       for (const col of table.columns) {
@@ -153,9 +196,13 @@ export async function POST(req: NextRequest) {
 
     const config = parsedReq.data;
     let aiHints: AISemanticColumnHint[] | undefined;
+    const schemaPreview = parsePostgresSchema(config.sql);
 
-    if (config.useAiEnrichment) {
-      const schemaPreview = parsePostgresSchema(config.sql);
+    // Motor Híbrido: Si el usuario activó useAiEnrichment y no se pasaron semillas previas,
+    // llamamos una ÚNICA vez a obtener 10 semillas del dominio
+    if (config.useAiEnrichment && !config.aiSeedContext) {
+      const origin = req.nextUrl.origin;
+      config.aiSeedContext = await fetchAiSeeds(schemaPreview.tables, config.locale, origin);
       aiHints = await resolveAiSemanticHints(schemaPreview.tables, config.locale);
     }
 
